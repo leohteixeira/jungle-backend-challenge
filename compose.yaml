@@ -1,0 +1,318 @@
+name: wagering
+
+x-app: &app
+  image: wagering-app:${APP_IMAGE_TAG:-local}
+  build: .
+  init: true
+  stop_grace_period: 45s
+  environment: &app-environment
+    TZ: UTC
+    NODE_ENV: ${NODE_ENV:-development}
+    PORT: "3000"
+    DB_HOST: ${APP_DB_HOST:-postgres}
+    DB_PORT: ${APP_DB_PORT:-5432}
+    DB_NAME: wagering
+    DB_USER: wagering
+    DB_PASSWORD: ${POSTGRES_PASSWORD:-local-wagering-only}
+    SQS_ENDPOINT: ${APP_SQS_ENDPOINT:-http://ministack:4566}
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: local
+    AWS_SECRET_ACCESS_KEY: local
+    AUTH_ISSUER: http://keycloak:8080/realms/wagering
+    AUTH_JWKS_URL: http://keycloak:8080/realms/wagering/protocol/openid-connect/certs
+    CONSUMER_CONCURRENCY: ${CONSUMER_CONCURRENCY:-10}
+    SQS_BATCH_SIZE: ${SQS_BATCH_SIZE:-10}
+    SQS_WAIT_SECONDS: ${SQS_WAIT_SECONDS:-20}
+    SQS_VISIBILITY_SECONDS: ${SQS_VISIBILITY_SECONDS:-30}
+    SQS_MAX_RECEIVES: ${SQS_MAX_RECEIVES:-5}
+    SQS_RETRY_BASE_SECONDS: ${SQS_RETRY_BASE_SECONDS:-2}
+    SQS_RETRY_MAX_SECONDS: ${SQS_RETRY_MAX_SECONDS:-30}
+    SHUTDOWN_DRAIN_MS: ${SHUTDOWN_DRAIN_MS:-25000}
+    TEST_SYNC_POINTS: ${TEST_SYNC_POINTS:-}
+    TEST_SYNC_MATCH: ${TEST_SYNC_MATCH:-}
+    OUTBOX_LEASE_MS: ${OUTBOX_LEASE_MS:-15000}
+    OUTBOX_RETRY_MAX_MS: ${OUTBOX_RETRY_MAX_MS:-300000}
+    REFERENCE_TTL_MS: ${REFERENCE_TTL_MS:-86400000}
+  depends_on:
+    bootstrap:
+      condition: service_completed_successfully
+    keycloak:
+      condition: service_healthy
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "bun",
+        "-e",
+        "const r=await fetch('http://127.0.0.1:3000/health/ready');process.exit(r.ok?0:1)",
+      ]
+    interval: 3s
+    timeout: 5s
+    retries: 30
+    start_period: 10s
+
+services:
+  docs:
+    image: oven/bun:1.4.3
+    profiles: [docs]
+    init: true
+    user: bun
+    working_dir: /app
+    read_only: true
+    command: ["bun", "--no-env-file", "scripts/preview-docs.ts"]
+    environment:
+      BUN_CONFIG_NO_AUTO_INSTALL: "true"
+    ports: ["127.0.0.1:${DOCS_HOST_PORT:-4173}:4173"]
+    volumes: [".:/app:ro"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "--no-env-file",
+          "-e",
+          "const r=await fetch('http://127.0.0.1:4173/docs/load-report/index.html');process.exit(r.ok?0:1)",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  verification-tools:
+    image: wagering-verification:local
+    build:
+      context: ./docker/verification
+    profiles: [verification]
+    init: true
+    logging: { driver: none }
+    network_mode: host
+    working_dir: ${VERIFICATION_SOURCE_DIR:-/verification-source}
+    volumes:
+      - ${VERIFICATION_SOURCE_DIR:-.}:${VERIFICATION_SOURCE_DIR:-/verification-source}:ro
+      - ${VERIFICATION_OUTPUT_DIR:-/tmp/wagering-verification}:${VERIFICATION_OUTPUT_DIR:-/verification-output}
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      BUN_CONFIG_NO_ENV_FILE: "true"
+      BUN_CONFIG_NO_AUTO_INSTALL: "true"
+      GIT_OPTIONAL_LOCKS: "0"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${VERIFICATION_SOURCE_DIR:-/verification-source}
+
+  verification-oha:
+    image: ghcr.io/hatoo/oha:1.16.0@sha256:3ec3dbf549ea197793482d47a6324797411406bbf438c2fe8b91f244ec641a2f
+    profiles: [verification]
+    logging: { driver: none }
+    network_mode: host
+
+  verification-pumba:
+    image: ghcr.io/alexei-led/pumba:1.2.1@sha256:780505fe261932765921c94a23e24bda107c72927654c26a5893a238d7708bf0
+    profiles: [verification]
+    logging: { driver: none }
+    volumes: [/var/run/docker.sock:/var/run/docker.sock]
+
+  verification-k6:
+    image: grafana/k6:2.3.0
+    profiles: [verification]
+    logging: { driver: none }
+    network_mode: host
+    volumes:
+      - ${VERIFICATION_SOURCE_DIR:-.}:${VERIFICATION_SOURCE_DIR:-/verification-source}:ro
+
+  verification-tcpdump-postgres:
+    image: wagering-verification:local
+    profiles: [verification]
+    logging: { driver: none }
+    network_mode: service:postgres
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_RAW, NET_ADMIN, SETGID]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    stop_signal: SIGINT
+    entrypoint: [tcpdump]
+    command: [-Z, root, -p, -i, any, -nn, -tt, -q, -l, "ip and tcp and port 5432 and not host 127.0.0.1"]
+
+  verification-tcpdump-ministack:
+    image: wagering-verification:local
+    profiles: [verification]
+    logging: { driver: none }
+    network_mode: service:ministack
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_RAW, NET_ADMIN, SETGID]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    stop_signal: SIGINT
+    entrypoint: [tcpdump]
+    command: [-Z, root, -p, -i, any, -nn, -tt, -q, -l, "ip and tcp and port 4566 and not host 127.0.0.1"]
+
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: [load]
+    user: "${LOAD_UID:-12345}:${LOAD_GID:-12345}"
+    volumes:
+      - ./load:/load:ro
+      - ${LOAD_RESULTS_DIR:-./load/results}:/results
+    environment:
+      LOAD_PHASE: ${LOAD_PHASE:-hot_wallet}
+      PROVIDER_A_SECRET: ${PROVIDER_A_SECRET:-local-dev-only-provider-a}
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0
+    profiles: [chaos]
+    init: true
+    ports: ["127.0.0.1:${TOXIPROXY_HOST_PORT:-8474}:8474"]
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    profiles: [observability]
+    init: true
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    ports: ["127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"]
+    volumes: ["./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  grafana:
+    image: grafana/grafana:13.3.0
+    profiles: [observability]
+    init: true
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_NAME: Main Org.
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports: ["127.0.0.1:${GRAFANA_HOST_PORT:-3001}:3000"]
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    init: true
+    stop_grace_period: 30s
+    command: ["start-dev", "--import-realm"]
+    environment:
+      TZ: UTC
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+      PROVIDER_A_SECRET: ${PROVIDER_A_SECRET:-local-dev-only-provider-a}
+      PROVIDER_B_SECRET: ${PROVIDER_B_SECRET:-local-dev-only-provider-b}
+      OPERATOR_SECRET: ${OPERATOR_SECRET:-local-dev-only-platform-operator}
+    ports: ["${KEYCLOAK_HOST_PORT:-8080}:8080"]
+    volumes: ["./docker/keycloak/wagering-realm.json:/opt/keycloak/data/import/wagering-realm.json:ro"]
+    healthcheck:
+      test:
+        ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.0\r\n\r\n' >&3; read -r status <&3; [[ $$status == *'200 OK'* ]]"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+
+  postgres:
+    image: postgres:17.11-alpine
+    init: true
+    stop_grace_period: 30s
+    environment:
+      TZ: UTC
+      POSTGRES_DB: wagering
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-wagering-only}
+    command:
+      ["postgres", "-c", "max_connections=200", "-c", "idle_in_transaction_session_timeout=10s"]
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ministack:
+    image: ministackorg/ministack:1.5.28
+    init: true
+    stop_grace_period: 30s
+    environment:
+      TZ: UTC
+      PERSIST_STATE: "1"
+      STATE_DIR: /data/ministack-state
+    ports: ["${SQS_HOST_PORT:-4566}:4566"]
+    volumes: ["ministack-data:/data"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:4566/_ministack/health', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  bootstrap:
+    <<: *app
+    command: ["bun", "src/cli/bootstrap.ts"]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ministack:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-environment
+      APP_ROLE: api
+
+  consumer:
+    <<: *app
+    environment:
+      <<: *app-environment
+      APP_ROLE: consumer
+
+  worker:
+    <<: *app
+    environment:
+      <<: *app-environment
+      APP_ROLE: worker
+
+  nginx:
+    image: nginx:1.31.8-alpine
+    init: true
+    stop_grace_period: 45s
+    # Proxy clients and upstreams need descriptors beyond Docker's inherited soft limit.
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    ports: ["${API_HOST_PORT:-3000}:3000"]
+    volumes: ["./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
+  ministack-data:
